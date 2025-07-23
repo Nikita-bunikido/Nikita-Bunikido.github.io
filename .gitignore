@@ -1,0 +1,6 @@
+work/
+posts/
+*.sh
+_*
+*.md
+Makefile

