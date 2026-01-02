@@ -1,0 +1,553 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.11.1/styles/default.min.css">
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.11.1/highlight.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.11.1/languages/c.min.js"></script>
+<script>hljs.highlightAll();</script>
+<link rel="stylesheet" href="../../jetbrains-mono.css">
+<link rel="stylesheet" href="../../style.css">
+<title>Blog</title>
+</head>
+
+<body>
+<div class="header-text" style="float: right; width: 10rem;">
+<img alt="alpine-logo" src="img/alpine-logo.png">
+</div>
+
+<p><a href="/">&#8592; Back</a>
+</p>
+
+<img class="header" alt="header" src="img/banner.jpg"
+width="100%">
+
+<div class="header-text" style="float: right">
+<p> 28/12/25 </p>
+</div>
+
+<p>Nikita Donskov</p>
+
+<h1>apk(8) without root via symbol overriding</h1>
+
+<p>I generally like winter, but now I can barely leave home because of the cold now. It means it's time to hack around with <code>apk(8)</code>, Alpine's Package Keeper!</p>
+
+<hr>
+
+<h2>Little background</h2>
+
+<p>I am a huge fan of <a href="https://alpinelinux.org">Alpine Linux</a> project. I use it</p>
+
+<ul>
+<li>on iPhone (<a href="https://ish.app">iSH</a>, i386)</li>
+<li>on Raspberry PI (armhf)</li>
+<li>on both of my laptops (x86_64)</li>
+<li>for Docker containers as base</li>
+<li>for <code>chroot(2)</code> jails</li>
+<li>... etc. etc. </li>
+</ul>
+
+<p>The thing I like most about Alpine is it's package management system. Alpine's <em>apk-tools</em> is different than other package managers in unique way</p>
+
+<blockquote>
+  <p>Package installation or removal is done as a side effect of modifying this system state.  It is also possible to edit /etc/apk/world with the text editor of your choice and then use apk fix to synchronize the installed packages with the desired system state.</p>
+</blockquote>
+
+<p>&#8212; <em>Ariadne's Space</em>, <a href="https://ariadne.space/2021/04/24/why-apktools-is-different-than.html">writeup</a>
+
+<h2>Rootless problems</h2>
+
+<p>I am currently working on a project which fits into Alpine's infrastructure and uses apk-tools. <code>apk(8)</code> has an option <strong>-p</strong>, <strong>--root ROOT</strong>:</p>
+
+<blockquote>
+  <p>Manage file system at ROOT.</p>
+</blockquote>
+
+<p>&#8212; <em>man 8 apk</em>
+
+<p>This basically allows to add/delete packages inside chroot, without invoking <code>chroot(1)</code>. One of the project's ideas is to avoid using root at all. Unfortunately, even inside chroot environment, apk-tools requires root priveges in order to change root-level directories permissions (GID &amp; UID) to 0, e.g. <strong>/etc</strong>, <strong>/usr</strong>, <strong>/bin</strong>. If one runs <code>apk(8)</code> as an unprivileged user, this kind of output is produced in attempt to install new package:</p>
+
+<pre>
+# apk --root /mnt/alpine-chroot add fortune
+ERROR: Unable to lock database: Permission denied
+ERROR: Failed to open apk database: Permission denied
+</pre>
+
+<p>Most of apk-tools files reside in <strong>/etc/apk</strong>, <strong>/lib/apk</strong> and similar directories. In typicall install they are owned by root and is not writable by an ordinary user. That's exactly what's going on here &#8212; <code>apk(8)</code> tries to gain write access to database lock at <strong>/etc/apk/db/lock</strong> and eventually fails:</p>
+
+<pre>
+# strace apk --root /mnt/alpine-chroot add fortune 2>&amp;1 | grep EACCES
+openat(3, "lib/apk/db/lock", O_RDWR|O_CREAT|O_LARGEFILE|O_CLOEXEC, 0600) = -EACCES (Permission denied)
+</pre>
+
+<p>One thing we can try here is to change owner of all files inside chroot to current user. Obviously that's unacceptable for real system, but goal here is to install package at any cost</p>
+
+<pre>
+$ doas chown -vR $UID:$UID /mnt/alpine-chroot
+$ apk --root /mnt/alpine-chroot add fortunte
+(1/3) Installing libmd (1.1.0-r0)
+(2/3) Installing libbsd (0.12.2-r0)
+(3/3) Installing fortune (0.1-r4)
+ERROR: 1 errors updating directory permissions
+Executing busybox-1.37.0-r14.trigger
+ERROR: busybox-1.37.0-r14.trigger: chroot: Operation not permitted
+ERROR: busybox-1.37.0-r14.trigger: script exited with error 127
+OK: 12 MiB in 27 packages
+</pre>
+
+<p>Despite a couple of errors, package got installed. Let's look closer at what apk-tools complains about:</p>
+
+<ol>
+<li>Directory permissions (We don't really care about that)</li>
+<li><strong>chroot: Operation not permitted</strong>-related messages (We care about that)</li>
+</ol>
+
+<h2>Value of install scripts</h2>
+
+<p>Besides other files <code>.apk</code> can contain one or more install scripts. They are shell scripts, which apk-tools execute during package installation. <a href="https://wiki.alpinelinux.org/wiki/Creating_an_Alpine_package">Alpine's wiki</a> describes 6 different kinds of install scripts. Because we are looking exclusively at package installation, we are only interested in two kinds of them:</p>
+
+<table>
+  <tr>
+    <th>Kind</th>
+    <th>File name</th>
+    <th>Description</th>
+  </tr>
+  <tr>
+    <td>Pre-install</td>
+    <td><strong>$pkgname.pre-install</strong></td>
+    <td><div class="t-overflow">Executed before package contents are unpacked</div></td>
+  </tr>
+  <tr>
+    <td>Post-install</td>
+    <td><strong>$pkgname.post-install</strong></td>
+    <td><div class="t-overflow">Executed after package contents are packed</div></td>
+  </tr>
+</table>
+
+<p>Apk-tools option <strong>--no-scripts</strong> can be used to ignore all install scripts found in package, which I initially used. Traditional UNIX/Linux programs consist of a one or two ELFs. Simple unpacking to rootfs can do the work. But it's not the case with more complex projects, such as <a href="https://busybox.net/">Busybox</a>
+
+<img alt="busybox size" src="img/busybox-size.png" style="width: 50%; float: left; margin: 1rem;" />
+
+<p>Busybox is used in Alpine instead of GNU coreutils by design. Binary at <strong>/bin/busybox</strong> is only around ~800K in my system! The idea is simple &#8212; instead of having unique binary for each UNIX command, <code>busybox(1)</code> combines all of them in one executable. It is also designed to be very small in order to perfectly fit into embedded devices, <a href="https://wiki.gentoo.org/wiki/Initramfs">initramfs</a> and other bizarre environments, where GNU coreutils might be an overhead. When called with no arguments, busybox prints a bit of metainfo, including available <em>applets</em> (UNIX utilities) it supports and exits. For example <code>readlink(2)</code> utility can be run by passing it's name as second argument:</p>
+
+<pre>
+$ busybox readlink /sbin/init
+/bin/busybox
+</pre>
+
+<p>Typing "busybox" every time is not necessary through. Program determines what applet to run by looking at the <a href="https://phys.au.dk/~fedorov/prog/2025/notes/cmdline.htm">very first</a> argument, <strong>argv[0]</strong>. Busybox is usually called through a symlink like that:</p>
+
+<pre>
+$ ls -lh1 $(command -v readlink)
+lrwxrwxrwx    1 root     root            12 Jan  8  2025 /usr/bin/readlink -> /bin/busybox
+$ readlink /proc/self/exe
+/bin/busybox
+</pre>
+
+<p>Without set of symbolic links, system doesn't meet POSIX requirements because of lack of standard UNIX utilities. In Alpine's system, <code>busybox(2)</code> symlinks are created during corresponding package installation, in post-install <a href="https://git.alpinelinux.org/aports/tree/main/busybox/busybox.post-install?h=3.23-stable#n5">script</a> <strong>busybox.post-install</strong>. If <strong>--no-scripts</strong> is passed <em>system basically becomes incomplete</em>
+
+<p>Even though this is one of the best examples where install scripts have critical role, there are many, many more. Look at <code>abuild(1)</code>. It <a href="https://git.alpinelinux.org/aports/tree/main/abuild/abuild.pre-install?h=3.23-stable#n3">creates</a> <em>abuild</em> group, so you can add desired user to that</p>
+
+<div style="background: #12cfc0; color: #000000; padding: 2rem">
+NOTE: Notice how all examples use either /bin/sh or /bin/busybox sh shebang, not /bin/bash or /usr/bin/env ... one. That's because there is no guarantee target system has anything, but /bin/sh symbolic link. You should rely only on that
+</div>
+
+<h2>Root cause</h2>
+
+<p>By looking at above errors we understand that problem is with permissions. But what exactly causes the issue? Apk-tools is written in C, meaning it makes common UNIX syscalls either by using libc or libc syscall stubs. One of the errors mentions chroot:</p>
+
+<pre>
+ERROR: busybox-1.37.0-r14.trigger: chroot: Operation not permitted
+</pre>
+
+<p>I'd looked into chroot-based application from Australian Down-Underground CTF (2025) not long ago, you can read about it in my previous <a href="https://nikita-bunikido.github.io/srv/220725/post.html">writeup</a>. From <code>chroot(2)</code>:</p>
+
+<blockquote>
+  <p>Only a privileged process (Linux: one with the CAP_SYS_CHROOT
+capability in its user namespace) may call chroot().</p>
+</blockquote>
+
+<p>Ordinary user doesn't have <strong>CAP_SYS_CHROOT</strong>, that's why Linux returns <strong>EACCESS</strong> here</p>
+
+<p>Let's find out why and where exactly does apk-tools call <code>chroot(2)</code>. I launched <a href="https://lldb.llvm.org/">LLDB</a> to set a breakpoint on desired routine and check backtrace on hit. Apk-tools is probably forking before chrooting, so setting <strong>follow-fork</strong> mode to "child" is necessary. <a href="https://stackoverflow.com/questions/19204395/lldb-equivalent-of-gdbs-follow-fork-mode-or-detach-on-fork">settings set</a> is lldb's way of doing it. It's kind of similar to what gdb has</p>
+
+<p>
+<img alt="apk-tools-backtrace" src="img/apk-tools-backtrace.png">
+</p>
+
+<p>Lucky me, at least top-level symbol names are there. Execution reaches <strong>libapk.so.2.14.0</strong>'s <code>apk_db_run_script()</code>. Apk-tools <a href="https://git.alpinelinux.org/apk-tools/tree/src/database.c?h=2.14-stable#n1949">call</a> <code>chroot(2)</code> with "." argument shortly after changing directory via <code>fchdir(2)</code>. If that fails, script doesn't get executed through <code>execve(2)</code> later on</p>
+
+<p>My idea is simple &#8212; override both <code>fchdir(2)</code> and <code>chroot(2)</code> behaviour. Hook has to return <strong>0</strong>, indicating operation's success, which will eventually lead to script execution below. The original behaviour must be preserved though, script has to be executed inside chroot. How on Earth can one achieve this without privileged <code>chroot(2)</code> syscall?</p>
+
+<h2>PRoot &#8212; the final frontier</h2>
+
+<p>Even though making <code>chroot(2)</code> priveleged is a great security mechanism, in lots of cases it's just sad thruth and heartbreaking. Imagine you have an Android-based non-rooted mobile phone and you wish to install Alpine Linux in a chroot, but you are unable to do so. In fact root priveleges aren't needed as long as you don't touch system files. If only there was some way to fool processes, so that they think they are actually executed as root... well, that's exactly what <a href="https://proot-me.github.io/">PRoot</a> project is aims to do!</p>
+
+<p>In short, <code>proot(1)</code> is <code>chroot(1)</code> implementation in userspace and can be called as an ordinary user. It does it's magic by hooking lots of system calls, e.g. <strong>open("/bin", O_READ+O_DIRECTORY)</strong> called by underlying program becomes <strong>open("/home/user/chroots/chroot/bin", O_READ+O_DIRECTORY)</strong>. It can emulate root permissions as well, in order to make root-only programs (like <code>apk(8)</code>) work. PRoot implements not only <code>chroot(1)</code>'s functionality. It's capable of doing <strong>mount --bind</strong>, execute binaries compiled for other architectures through QEMU userspace emulator and has lots of other cool features</p>
+
+<p>Despite all this amazing stuff, it's not ideal. By using lots of hooks it creates time overhead. You don't really feel it while doing ordinary operations, but it becomes quite noticeable when compiling or doing other expensive calculations</p>
+
+<p>Hooks have to do the following:</p>
+
+<ol>
+<li><code>execve(2)</code> &#8212; the most complex one. It needs to:
+<ul>
+<li>Parse passed <strong>argv</strong> and extract program arguments</li>
+<li>Check previously selected working directory. If it's ".", use <strong>$PWD</strong></li>
+<li>Construct set of environment variables for <code>proot(1)</code> (if needed)</li>
+<li>Eventually call <code>proot(1)</code> with the requested pathname</li>
+</ul></li>
+<li><code>chroot(2)</code> &#8212; fake chroot operation. Remember <strong>path</strong> argument to check it later if needed &amp; return <strong>0</strong>, indicating success</li>
+</ol>
+
+<h2>Syscall stubs and symbol overriding</h2>
+
+<p>Linux is keeping an eye on system call numbers to achieve backwards compatibility, so they aren't changed between versions. This way older software can run on modern systems without much trouble. That's not the case with other kernels though, even UNIX or UNIX-like. That's exactly the reason why dynamic programs usually don't perform system calls directly, but rather using <em>syscall stubs</em>. Syscall stubs are often found in libc implementations. Here's stub for <code>chroot(2)</code> from MUSL libc on my system:</p>
+
+<p>
+<img alt="chroot-stub" src="img/chroot-stub.png">
+</p>
+
+<p>If for whatever reason <code>chroot(2)</code> system call number changes from <strong>0xa1</strong> to something else during system update, libc stub will be updated too, so upper-level programs won't break</p>
+
+<p>Hooking system call stubs isn't any harder than hooking any other functions, because they are basically functions too (as most of the symbols exported by libc). Simplest way to do that without patching at runtime is to use symbol overriding via <strong>LD_PRELOAD</strong> dynamic loader's environment variable. Even GNU project <a href="https://www.gnu.org/software/libc/manual/html_node/Replacing-malloc.html">suggests</a> this technique to replace Glibc's <code>malloc(3)</code> implementation if needed</p>
+
+<p>Mechanism is quite straightforward: dynamic loader loads any objects listed in <strong>LD_PRELOAD</strong> variable prior to loading any other object to memory during process startup, including libc. If you define symbol which has the same name as symbol in libc, dynamic linker will use that instead of original one</p>
+
+<pre>
+$ cat &lt;&lt;EOF &gt;test.c 
+> #include &lt;stdio.h&gt;
+> int main(){ printf("Please, write that text!\n"); return 0; }
+EOF
+$ cat &lt;&lt;EOF &gt;preload.c
+> #include &lt;unistd.h&gt;
+> int printf(const char *, ...){ return write(1, "no.\n", 4); }
+EOF
+$ CFLAGS='-fno-builtin -O0' make test
+$ cc -shared -fPIC -o libpreload.so.1 preload.c
+$ ./test
+Please, write that text!
+$ LD_PRELOAD=libpreload.so.1 ./test
+no.
+</pre>
+
+<p><code>printf(3)</code> is using <code>write(2)</code> system call internally. Hooking <code>write(2)</code> leads to full control over data actually printed to TTY</p>
+
+<p>I am using <strong>-fno-builtin -O0</strong> in this example because some compilers might replace <code>printf(3)</code> call with <code>puts(3)</code>, which is absolutely legal optimization in real world</p>
+
+<h2>Hook implementation</h2>
+
+<p>Keep in mind that even though there is combination of <code>fchdir(2)</code> and <code>chroot(2)</code> in one place of apk-tools source, it may not be the the case for the whole codebase. Nothing stops it from calling <code>chroot(2)</code> with argument other, than ".". This case should not be forgotten</p>
+
+<pre><code class="language-c">#define _GNU_SOURCE
+#define _POSIX_C_SOURCE
+#include &lt;limits.h&gt;
+#include &lt;unistd.h&gt;
+#include &lt;string.h&gt;
+
+static char chroot_path[PATH_MAX];
+
+int chroot(const char *path)
+{
+    strcpy(chroot_path, !strcmp(path, ".")
+        ? get_current_dir_name()
+        : path);
+
+    return 0;
+}
+</code>
+</pre>
+
+<p>Instead of actually changing root, hook saves new root path into <strong>chroot_path</strong>. Absolute path is needed from now on, so it checks whether it's ".", and if it really is so, then it gets current directory path from <code>get_current_dir_name(3)</code>
+
+<p>I also quickly designed simple helper function, <strong>void push_argvp(char **, ...)</strong>. It appends any strings passed to <strong>...</strong> to the end of provided string array</p>
+
+<pre><code class="language-c">char *args[12] = { "hello", "world", "what\'s", "next?", NULL };
+push_argvp(args, "I", "honestly", "don\'t", "know", NULL);
+__builtin_trap();
+</code>
+</pre>
+
+<p>After execution the <strong>args</strong> contents are:</p>
+
+<p>
+<img alt="args values" src="img/vars.png">
+</p>
+
+<p>It is necessary to provide a bit more arguments to PRoot than just new root and executable's pathname with parameters. Options I use:</p>
+
+<ul>
+<li><strong>-0</strong> &#8212; <em>Emulate <strong>root</strong> priveleges</em>. Executed program thinks it's EUID is 0</li>
+<li><strong>-w /</strong> &#8212; <em>Change initial working directory to</em> <strong>/</strong></li>
+<li><strong>-b</strong> &#8212; <em>Bind-mount directory</em>. Even to use <strong>/dev/null</strong>, script needs <strong>devfs</strong> to be mounted. This option does it prior to executing given program</li>
+</ul>
+
+<p>Resulting command line becomes:</p>
+
+<pre>
+proot -0 -w / -b /dev -b /proc -b /sys -r &lt;new root&gt; &lt;program&gt; &lt;parameters&gt;
+</pre>
+
+<p>This is how it looks in the hook:</p>
+
+<pre><code class="language-c">int execve(const char *path, char *const argv[],
+    char *const envp[])
+{
+    char *argvp[32];
+
+    /* ... */
+
+    memset(argvp, 0, sizeof argvp);
+    push_argvp(argvp,
+        "proot", "-0",
+        "-w", "/",
+        "-b", "/dev",
+        "-b", "/proc",
+        "-b", "/sys",
+        "-r", chroot_path, path, NULL);
+
+    argv ++; /* Skip program's name argument; we have our own */
+    while (*argv) {
+            push_argvp(argvp, *argv++, NULL);
+    }
+</code>
+</pre>
+
+<h2>/tmp dilemma</h2>
+
+<p><code>file-hierarchy(7)</code> describes POSIX-compatible system rootfs layout. <strong>/tmp</strong> directory by convention is used by programs to store temporary files</p>
+
+<blockquote>
+  <p>The place for small temporary files. This directory is usually
+mounted as a "tmpfs" instance, and should hence not be used
+for larger files. (Use /var/tmp/ for larger files.) This
+directory is usually flushed at boot-up. Also, files that are
+not accessed within a certain time may be automatically
+deleted.</p>
+</blockquote>
+
+<p>In most cases the data in <strong>/tmp</strong> isn't executable. That's why some system administrators (including myself) decide to create it on a separate partition, mounted with <strong>noexec</strong> flag (<code>mount(8)</code>) to disallow executing any files there on the kernel level</p>
+
+<pre>
+$ mount | grep '/tmp[[:space:]]'
+/dev/nvme0n1p3 on /tmp type btrfs (rw,nosuid,noexec,...
+</pre>
+
+<p>However, any attempt to run <code>proot(1)</code> with read-only <strong>/tmp</strong> leads to an error</p>
+
+<pre>
+proot error: it seems the current temporary directory (/tmp) is mounted with no execution permission.
+proot info: Please set PROOT_TMP_DIR env. variable to an alternate location '/XXX/XXX/tmp' for example).
+proot error: execve("/bin/sh"): No such file or directory
+proot info: possible causes:
+  * the program is a script but its interpreter (eg. /bin/sh) was not found;
+  * the program is an ELF but its interpreter (eg. ld-linux.so) was not found;
+  * the program is a foreign binary but qemu was not specified;
+  * the loader was not found or doesn't work.
+fatal error: see `proot --help`.
+</pre>
+
+<p>Even if most programs do not execute their files in <strong>/tmp</strong>, it doesn't necessarily mean all of them behave like that. Message above suggests pointing <strong>PROOT_TMP_DIR</strong> to some other place, which has executable permission. After doing so, everything is running normally</p>
+
+<p>One can't simply modify data <strong>envp</strong> points to. There is an option to duplicate it to some local array and append <strong>PROOT_TMP_DIR</strong> to the end, but is it really needed? What if apk-tools call <code>execve(2)</code> with zeroed-out <strong>envp</strong>? <strong>database.c</strong> <a href="https://git.alpinelinux.org/apk-tools/tree/src/database.c?h=2.14-stable#n1931">creates</a> <strong>environment</strong> with only one variable in it &#8212; <strong>PATH</strong>. Nothing stops us from ignoring this environment and constructing our own, with both  <strong>PATH</strong> and <strong>PROOT_TMP_DIR</strong>
+
+<pre><code class="language-c">int execve(const char *path, char *const argv[],
+    char *const envp[])
+{
+    char *tmpdir, *argvp[32];
+
+    /* ... */
+
+    asprintf(&amp;tmpdir, "PROOT_TMP_DIR=%s/tmp", chroot_path);
+    char * const env[] = {
+        "PATH=/usr/sbin:/usr/bin:/sbin:/bin",
+        tmpdir,
+        NULL
+    };
+
+    execve_p("/usr/bin/proot", argvp, env);
+    return -1;
+}
+</code>
+</pre>
+
+<p>Now let's compile hooks and see whether everything works:</p>
+
+<pre>
+$ chroot .
+chroot: can't change root directory to '.': Operation not permitted
+$ cc -fPIC -shared -o libchroot2proot.so.1 chroot2proot.c
+$ mkdir test-root
+$ LD_PRELOAD=./libchroot2proot.so.1 apk \
+    --allow-untrusted \
+    --initdb \
+    --root test-root \
+    --repository https://dl-cdn.alpinelinux.org/alpine/latest-stable/main/ \
+    add busybox
+(1/2) Installing musl (1.2.5-r21)
+(2/2) Installing busybox (1.37.0-r30)
+Executing busybox-1.37.0-r30.post-install
+ERROR: 16 errors updating directory permissions
+Executing busybox-1.37.0-r30.trigger
+OK: 1 MiB in 2 packages
+</pre>
+
+<p>
+<img alt="symlinks" src="img/symlinks.png">
+</p>
+
+<p>As you can see, symlinks are in fact there after processing <strong>busybox-1.37.0-r30.post-install</strong> in new root!</p>
+
+<h2>ERROR: XX errors updating directory permissions</h2>
+
+<p>Apk-tools is trying to update permissions of installed objects and seemingly fails. This is not critical, but I felt like fixing this one too. Message itself comes from <code>apk_db_update_directory_permissions()</code> if <strong>ctx.errors</strong> <a href="https://git.alpinelinux.org/apk-tools/tree/src/database.c?h=2.14-stable#n2017">is</a> not zero. This field is <a href="https://git.alpinelinux.org/apk-tools/tree/src/database.c?h=2.14-stable#n1985">edited</a> before by <code>update_permissions()</code> callback</p>
+
+<p>
+<img alt="fchownat" src="img/fchownat.png">
+</p>
+
+<p>Notice how both <code>fchmodat(2)</code> and <code>fchownat(2)</code> are executed only if <code>fstatat(2)</code> doesn't fail. My first though was to return error from that, but it would possibly break other stuff, e.g. libc in the worst case. More harmless solution is to override <code>fchownat(2)</code>
+
+<pre><code class="language-c">int fchownat(int dirfd, const char *pathname, uid_t owner, gid_t group, int flags)
+{
+    __typeof__(fchownat) *fchownat_p = dlsym(RTLD_NEXT, "fchownat");
+
+    return (owner != geteuid()) || (group != getegid())
+        ? 0
+        : fchownat_p(dirfd, pathname, owner, group, flags);
+}
+</code>
+</pre>
+
+<p><strong>RTLD_NEXT</strong> is pseudo-handle, which is used to search for next symbol with the same name. If application is trying to change owner to UID, which is not EUID, hook pretends everything is okay by doing nothing and returning <strong>0</strong>
+
+<p>Let's try once again:</p>
+
+<pre>
+$ LD_PRELOAD=./libchroot2proot.so.1 apk \
+    --allow-untrusted \
+    --initdb \
+    --root test-root \
+    --repository https://dl-cdn.alpinelinux.org/alpine/latest-stable/main/ \
+    add busybox
+(1/2) Installing musl (1.2.5-r21)
+(2/2) Installing busybox (1.37.0-r30)
+Executing busybox-1.37.0-r30.post-install
+Executing busybox-1.37.0-r30.trigger
+OK: 1 MiB in 2 packages
+</pre>
+
+<p>The error message is gone, everything works like a charm</p>
+
+<h2>Other methods of rootless apk(8)</h2>
+
+<h3>SUID bit</h3>
+
+<p>Using <strong>SUID</strong> bit on apk-tools. This is used internally by Alpine's build system. Package <strong>abuild-sudo</strong> provides <strong>abuild-sudo</strong> binary, which has <strong>SUID</strong> set. <strong>abuild-apk</strong>, <strong>abuild-adduser</strong> &amp; <strong>abuild-addgroup</strong> are all symlinks pointing to it. <strong>abuild-sudo</strong> determines which program to run by looking at part after '-' in <strong>argv[0]</strong>
+
+<pre>
+$ apk info --quiet --contents abuild-sudo |
+> sed -e '/^$/d' -e 's|^|/|' |
+> xargs ls -l1h
+lrwxrwxrwx    1 root     root          11 Aug 12 10:48 /usr/bin/abuild-addgroup -> abuild-sudo
+lrwxrwxrwx    1 root     root          11 Aug 12 10:48 /usr/bin/abuild-adduser -> abuild-sudo
+lrwxrwxrwx    1 root     root          11 Aug 12 10:48 /usr/bin/abuild-apk -> abuild-sudo
+-r-sr-xr-x    1 root     root       13.9K Jan  3  2025 /usr/bin/abuild-sudo
+</pre> 
+
+<h3>Bubblewrap</h3>
+
+<p>Using <a href="https://github.com/containers/bubblewrap">Bubblewrap</a>'s <code>bwrap(1)</code> to create unprivileged sandbox and use <code>apk(8)</code> in it. That method is implemented in <code>abuild(1)</code> (see <strong>rootbld</strong> command) and <a href="https://wiki.alpinelinux.org/wiki/Abuild_and_Helpers">documented</a> on wiki</p>
+
+<blockquote>
+  <p>You may now build your packages from source in an unprivileged sandbox based on bubblewrap with the command:</p>
+
+<p>abuild rootbld</p>
+</blockquote>
+
+<p>Additional package <strong>abuild-rootbld</strong> is needed</p>
+
+<h3>User namespaces</h3>
+
+<p>Using <em>User namespaces</em>, as described in <code>user_namespaces(7)</code>. This kernel feature allows running commands with UID 0 (from the inside). Check out <a href="https://blog.brixit.nl/bootstrapping-alpine-linux-without-root/">this</a> awesome writeup by Martin Braam</p>
+
+<blockquote>
+  <p>This does have a lot of limitations though which I somehow all manage to hit with this.</p>
+</blockquote>
+
+<p>&#8212; <em>Martin Braam</em>
+
+<h3>Summary</h3>
+
+<table>
+  <tr>
+    <th>Method</th>
+    <th>Author(s)</th>
+    <th>Pitfalls</th>
+  </tr>
+  <tr>
+    <td>SUID</td>
+    <td>Alpine's team</td>
+    <td>Having another rarely used SUID binary on system might be considered as security risk</td>
+  </tr>
+  <tr>
+    <td>Bubblewrap</td>
+    <td>Alpine's team</td>
+    <td>Needs additional setup when running inside container</td>
+  </tr>
+   <tr>
+     <td>User namespaces</td>
+     <td>Martin Braam</td>
+     <td>Needs manual setup. More experimental than end-user ready</td>
+   </tr>
+</table>
+
+<h2>Conclusion</h2>
+
+<p>Of course this solution is not bulletproof by any means and has it's own pitfalls. Anyway, it was truly interesting journey investigating apk-tools internals and revisiting chroot mechanism once again</p>
+
+<p>I am also surprised how basically any topic can be turned into research with a bit of an effort. Also I really enjoy how changing things on the lowest level possible influences upper levels a lot. That's absolutely beautiful</p>
+
+<hr>
+
+<h2>Useful resources</h2>
+
+<h3>Blogposts</h3>
+
+<ul>
+<li><a href="https://ariadne.space/2021/04/24/why-apktools-is-different-than.html"><em>Why apk-tools is different than other package managers</em></a>, Ariadne's Space</li>
+<li><a href="https://blog.brixit.nl/bootstrapping-alpine-linux-without-root/"><em>Bootstrapping Alpine Linux without root</em></a>, Martin Braam</li>
+</ul>
+
+<h3>Projects</h3>
+
+<ul>
+<li><a href="https://busybox.net/">Busybox</a> &#8212; tool, which combines common UNIX utilities into a single small executable</li>
+<li><a href="https://lldb.llvm.org/">LLDB</a> &#8212; debugger, replacement for GNU's Gdb, developed by llvm project</li>
+<li><a href="https://github.com/containers/bubblewrap">Bubblewrap</a> &#8212; toolsuit for creating unprivileged sandboxes</li>
+<li><a href="https://proot-me.github.io/">PRoot</a> &#8212; userspace <code>chroot(2)</code>, <strong>mount --bind</strong> implementation and many more</li>
+</ul>
+
+<h3>Alpine Wiki articles</h3>
+
+<ul>
+<li><a href="https://wiki.alpinelinux.org/wiki/Apk_spec"><em>Apk spec</em></a></li>
+<li><a href="https://wiki.alpinelinux.org/wiki/Creating_an_Alpine_package"><em>Creating an Alpine package</em></a></li>
+<li><a href="https://wiki.alpinelinux.org/wiki/Abuild_and_Helpers"><em>Abuild and helpers</em></a></li>
+</ul>
+
+<h3>Alpine's source code</h3>
+
+<ul>
+<li><a href="https://git.alpinelinux.org/aports/tree/?h=3.23-stable">Aports tree</a></li>
+<li><a href="https://git.alpinelinux.org/apk-tools/tree/?h=2.14-stable">Apk-tools source</a></li>
+</ul>
+
+<h3>Miscellaneous</h3>
+
+<ul>
+<li><a href="https://phys.au.dk/~fedorov/prog/2025/notes/cmdline.htm"><code>main()</code> arguments</a></li>
+</ul>
+</body>
+</html>
